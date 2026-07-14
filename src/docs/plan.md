@@ -1,0 +1,93 @@
+# Procurement Document Sync Tool (console app)
+
+## Context
+
+The user's company bids on Romanian public-procurement software-development tenders. Each tender publishes documents such as "caiet de sarcini" (technical spec) and "fișă de date" (data sheet). The broader goal (beyond this app) is to eventually find recurring requirement categories across many such tenders and figure out which reusable module to build/certify next. **This app's scope is only the data-collection step: discover tenders via the platform's API, download their public documents, and convert them to clean text (Markdown) so an LLM (or a human) can read and analyze them later.** No clustering, categorization, requirement extraction, or report generation happens inside this app — that was cut from scope; the plain-text/Markdown corpus this app produces is the deliverable.
+
+The repo (`c:\work\procurement_analysis2\src`) currently has an empty scaffold: `Procurement.Analysis.sln` + `Procurement.Analysis.csproj` (net9.0) with a default "Hello, World!" `Program.cs`, plus `openapi.procurement.json` (18.5k lines) describing the existing procurement platform's API that this app will call as a client.
+
+Decisions made during scoping:
+- **No server-side markdown conversion.** Use the platform's raw file **download** endpoint to get the original PDF/DOCX, then convert locally via **Aspose.Words** (the user already has this library available — it opens PDF/DOCX natively and exports directly to `SaveFormat.Markdown`, no COM/Office install, no STA thread, no HTML intermediate step needed).
+- **No database, no analysis step.** The converted `.md` files themselves, committed to source control, ARE the persisted history/output. Re-running the sync only downloads/converts files that don't already have a corresponding `.md` on disk — this is the idempotency mechanism (git-trackable, works across clones).
+- **Single root: `output/{procedureNumber}/{originalName}.md`.** No filename sanitization, no prefixing, no collision handling — converted files keep their original document name exactly, extension swapped to `.md`. Folders are named after the procedure's public **number** (e.g. `SCN12238989`), not its internal numeric id.
+- **No filtering by document type.** Every public document for a procedure gets downloaded and converted to text — not just ones flagged technical/administrative. The `analysis` flags from the API are not used to skip anything.
+- Auth goes through **Azure B2C**, wired via MSAL client-credentials, even though the specific endpoints used here are anonymous per the spec (`"security": [{}]`) — this future-proofs the client for endpoints that do require it, and matches the platform's existing Bearer JWT scheme.
+
+## Progress so far
+
+Step 1 of the build order (scaffolding) is partially done:
+- Folders created: `Cli/`, `Config/`, `Api/Generated/`, `Sync/` under `Procurement.Analysis/` (an `Analysis/Clustering/` folder was also created but is no longer needed per the scope cut above — delete it).
+- NuGet packages already added to `Procurement.Analysis.csproj`: `Refit`, `Refit.HttpClientFactory`, `Microsoft.Identity.Client`, `Microsoft.Extensions.Hosting`, `Microsoft.Extensions.Configuration.EnvironmentVariables`, `Microsoft.Extensions.Configuration.UserSecrets`, `Microsoft.Extensions.Http`, `ReverseMarkdown`, `Markdig`, `Microsoft.Office.Interop.Word` (v15.0.4797.1004 PIA).
+- **Package cleanup needed**: remove `Microsoft.Office.Interop.Word`, `ReverseMarkdown`, and `Markdig` (all no longer used — Word Interop was replaced by Aspose.Words, and Markdig was only for the now-cut analysis step); add `Aspose.Words` instead.
+- Not yet done: `Config/*.cs` option classes, `appsettings.json`, `Cli/CommandLineArgs.cs`, `Program.cs` DI wiring, the `refitter`-generated client, and everything in `Sync/` (steps 2-5 below are all still pending).
+
+## Confirmed API contract (read directly from `openapi.procurement.json`)
+
+- `POST /api/procedures/initiated/search` (operationId `ProceduresSearchInitiated`, anonymous) — body `ProceduresController_SearchRequest { keyword?, cvPs: string[] (required — CPV codes, e.g. 72xxxxxx IT-services family), pageIndex, pageSize, includeExpired, sortDescending, ... }`. Response `Procedures_Intention_SearchInitiated_Response { procedures: Procedures_Intention_InitiatedNoticeSummaryResponse[], total }`, each item having `id` (procedure id used in path calls), `number` (human-readable notice number, e.g. `SCN12238989` — used for the folder name), `procedure` (title/authority), dates.
+- `GET /api/procedures/{procedureId}/documents/public` (operationId `ProcedureDocumentsGetPublicDocuments`, anonymous) — lists files: `{ id, name, uri?, pages?, createdAt, size?, analysis? }`. The `analysis` flags exist but are **not used** — every listed file is downloaded and converted, no type filtering.
+- `GET /api/procedures/{procedureId}/documents/{fileId}` (operationId `ProcedureDocumentsGetFileContent`, anonymous) — **the download endpoint**: raw original file bytes.
+
+These three operations are the only ones needed from the spec.
+
+## Architecture
+
+```
+Procurement.Analysis/
+  Program.cs                          composition root, command dispatch (no [STAThread] needed — Aspose.Words is pure .NET, not COM)
+  Cli/
+    CommandLineArgs.cs                tiny --flag value parser (no System.CommandLine — surface is too small)
+  Config/
+    ApiOptions.cs                     BaseUrl (placeholder, user fills in), timeout
+    AzureAdOptions.cs                 TenantId/ClientId/ClientSecret/Scope (placeholders)
+    PipelineOptions.cs                default CPV codes/keywords, which analysis flags to download/convert
+  Api/
+    Generated/
+      refitter.settings.json          points at ../../../openapi.procurement.json, operationId filter = the 3 above
+      ProcurementApiClient.cs         generated by `refitter` CLI tool, committed, header comment on regeneration
+    AuthTokenProvider.cs              MSAL ConfidentialClientApplication, returns null (not throws) if unconfigured/fails
+    AuthenticationHandler.cs          DelegatingHandler: adds Bearer if a token was obtained, else passes through + logs once
+  Sync/
+    ProcedureDiscoveryService.cs      pages through ProceduresSearchInitiated for given CPV codes/keyword
+    DocumentDownloadService.cs        lists public docs per procedure (no filtering), downloads not-yet-converted files to .cache/
+    ConversionTracker.cs              given procedure number + name -> does output/{number}/{name}.md already exist? that's the only check
+    DocumentConverter.cs              Aspose.Words: new Document(inputPath) -> doc.Save(outputPath, SaveFormat.Markdown); per-file try/catch so one bad file doesn't abort the batch
+  Procurement.Analysis.csproj
+  appsettings.json                    placeholders only, real secrets via user-secrets/env vars
+output/{procedureNumber}/{originalName}.md               committed — the durable output/history of converted documents; single root, no sanitized/prefixed names
+.cache/downloads/{procedureNumber}/{originalName}.<ext>  gitignored — raw originals, transient, deleted after successful conversion
+```
+
+## CLI
+
+One command (this app now does exactly one thing):
+- `sync --cpv 72212000,72212900 --keyword "dezvoltare software"` — queries procedures (paginated), for each: lists all public docs, skips any file whose `output/{procedureNumber}/{name}.md` already exists, downloads the rest into `.cache/downloads/{procedureNumber}/`, converts each via Aspose.Words into `output/{procedureNumber}/`, deletes the cached original on success.
+
+## Document conversion detail (Aspose.Words)
+
+Per file: `new Aspose.Words.Document(cachedOriginalPath)` (handles both `.docx` and `.pdf` input natively — Aspose.Words imports PDF content into its document model), then `doc.Save(outputMdPath, Aspose.Words.SaveFormat.Markdown)` writes clean Markdown directly — headings/lists/tables preserved, no HTML intermediate, no COM/Office install dependency, no STA-thread requirement (pure managed .NET). Wrapped in a per-file try/catch so one corrupt/unsupported document logs a warning and the batch continues rather than aborting. Requires an Aspose.Words license (the user has one) applied once at startup via `Aspose.Words.License.SetLicense(path)` — evaluation mode otherwise stamps output with a watermark/limits, so the plan flags this as a required setup step.
+
+## NuGet packages
+
+`Refit`, `Refit.HttpClientFactory`, `Microsoft.Identity.Client` (MSAL), `Microsoft.Extensions.Hosting` + `Configuration.*` + `Http`, `Aspose.Words`. The `refitter` client generator is a `dotnet tool`, not a package dependency. (`Microsoft.Office.Interop.Word`, `ReverseMarkdown`, and `Markdig`, added earlier before scope was finalized, should be removed — none are used anymore.)
+
+## Build order
+
+0. Write this plan's content into the repo as committed documentation at `c:\work\procurement_analysis2\docs\plan.md`, so it's version-controlled alongside the code rather than living only in Claude's local plan storage.
+1. Delete the now-unused `Analysis/` folder; swap packages (`dotnet remove package Microsoft.Office.Interop.Word ReverseMarkdown Markdig`, `dotnet add package Aspose.Words`). Scaffold `Config/*`, `appsettings.json` (placeholders), `Cli/CommandLineArgs.cs`, `Program.cs` skeleton with DI wiring — verify `dotnet build`.
+2. Generate `Api/Generated/*` via `refitter` against `openapi.procurement.json` filtered to the 3 operationIds; commit output.
+3. `Api/AuthTokenProvider.cs` + `AuthenticationHandler.cs` — verify calling `sync` against the anonymous endpoints still works with placeholder AAD config (only a logged warning, no crash).
+4. `Sync/ProcedureDiscoveryService.cs` + `DocumentDownloadService.cs` + `ConversionTracker.cs` — verify a `sync` dry-run correctly lists/filters documents and skips ones with an existing `.md`.
+5. `Sync/DocumentConverter.cs` — verify end-to-end on 2-3 real procedures: `.cache/downloads/{NUMBER}/` gets originals, `output/{NUMBER}/` gets matching `.md` files with readable text/structure, re-running `sync` converts zero new files (idempotency confirmed).
+
+### Critical files
+- `c:\work\procurement_analysis2\src\openapi.procurement.json`
+- `c:\work\procurement_analysis2\src\Procurement.Analysis\Api\Generated\refitter.settings.json`
+- `c:\work\procurement_analysis2\src\Procurement.Analysis\Sync\DocumentConverter.cs`
+- `c:\work\procurement_analysis2\src\Procurement.Analysis\Sync\ConversionTracker.cs`
+- `c:\work\procurement_analysis2\src\Procurement.Analysis\Program.cs`
+
+## Open items requiring the user's input before/while running (not blocking the plan)
+- Real API base URL (not present in the OpenAPI spec).
+- Azure B2C tenant id / client id / client secret (or certificate) / scope.
+- Confirm default CPV code(s)/keywords to seed the search (e.g. `72xxxxxx` IT-services family + "dezvoltare software").
+- Location of the Aspose.Words license file and how it should be supplied to the app (config path vs. embedded resource vs. env var).
